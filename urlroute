@@ -1,0 +1,503 @@
+#!/bin/sh
+
+#Things that can be changed
+VPN_NAME=$1
+VPN_SERVER=$2
+DEBUG_LEVEL="debug"			#can be set with the -d option, valid debug, error, warn, info
+LOGGING=1				#Totally disable logging = 0
+SYSLOGTYPE=0 				#can be set with the -r option, 0=logread, 1=file
+SYSLOGFILE="/mnt/usb/log/syslog"	#can be set with the -s option, SYSLOGTYPE has to be 1
+
+#Things that should not need changing
+VERSION="URLroute 0.12b (c)James A R Brown 2014"
+ROOT_FOLDER="/etc/urlroute/$VPN_NAME"
+CONF_FOLDER=$ROOT_FOLDER/conf
+TEMP_FILE_DIR="/etc/urlroute/$VPN_NAME/tmp"
+VPN_EXECUTABLE="/usr/sbin/openvpn"
+DEFAULT_DEV_TUN="tun2" 			#can be set with the -d option
+WAN_DEV="br-wan" 			#can be set with the -w option
+SCREEN_DNS=0				#can be set with the -n option
+LOG_ERROR=0
+LOG_INFO=0
+LOG_WARN=0
+LOG_DEBUG=0
+
+help() 
+{
+	echo "URLroute $VERSION"
+	echo
+	echo "Usage"	
+	echo "urlroute VPN_SERVER_NAME VPN_SERVER_IP [-hvfdlwnrw]Â"
+	echo 
+	echo "Basic Options :"
+	echo "-h		: This help file"
+	echo "-v		: Version"
+	echo 
+	echo "Command Options : "	
+	echo "-f		: Flush the routing table"
+	echo "Parameters	"
+	echo	
+	echo "-d tun dev	: The tunnel dev, tun1 would be -d 1, default value is tun0"
+	echo "-l debuglevel	: Debugging Level, Valid are info, warning and error"
+	echo "-w wan device     : The WAN device, default value is br-wan"
+	echo "-n dns names 	: Screen the DNS logs for devices in devicegrab.conf"
+	echo "-r log type	: Specify 0 (default) for logread, 1 for a file specified by -w"
+	echo "-s log file	: Specify the location of the system log file"
+	
+	exit 0
+}
+
+initloglevels() {
+	if [ $DEBUG_LEVEL == "debug" ];then
+        	LOG_ERROR=1
+                LOG_INFO=1
+                LOG_WARN=1
+                LOG_DEBUG=1
+        fi
+        if [ $DEBUG_LEVEL == "info" ];then       
+                LOG_ERROR=1        
+                LOG_INFO=1        
+                LOG_WARN=1        
+                LOG_DEBUG=0        
+        fi    
+        if [ $DEBUG_LEVEL == "warn" ];then       
+                LOG_ERROR=1        
+                LOG_INFO=0        
+                LOG_WARN=1        
+                LOG_DEBUG=0        
+        fi    
+        if [ $DEBUG_LEVEL == "error" ];then       
+                LOG_ERROR=1        
+                LOG_INFO=0        
+                LOG_WARN=0        
+                LOG_DEBUG=0        
+        fi    
+}
+
+syslog()
+{
+	if [ $LOGGING == 1 ]; then
+		#Severity error, warn, info, debug
+		MESSAGE=$1
+		SEVERITY=$2
+
+		if [ $SEVERITY == "debug" -a $LOG_DEBUG == 1 ]; then
+			/usr/bin/logger -s -p "daemon.$SEVERITY" -t "URLroute[$$] [Debug  ]" "$MESSAGE"
+		fi
+                if [ $SEVERITY == "info" -a $LOG_INFO == 1 ]; then
+			/usr/bin/logger -s -p "daemon.$SEVERITY" -t "URLroute[$$] [Info   ]" "$MESSAGE"
+                fi
+                if [ $SEVERITY == "warn" -a $LOG_WARN == 1 ]; then
+			/usr/bin/logger -s -p "daemon.$SEVERITY" -t "URLroute[$$] [Warning]" "$MESSAGE"
+                fi
+                if [ $SEVERITY == "error" -a $LOG_ERROR == 1 ]; then
+			/usr/bin/logger -s -p "daemon.$SEVERITY" -t "URLroute[$$] [Error  ]" "$MESSAGE"
+                fi
+	fi
+}
+
+flush()
+{
+	syslog "Flushing the routing table for $DEFAULT_DEV_TUN" "info"
+	syslog "ip route flush dev $DEFAULT_DEV_TUN via $TUN_GATEWAY" "debug"
+	if [ -s $TEMP_FILE_DIR/VPN_routing_tempfile ]; then
+		rm $TEMP_FILE_DIR/VPN_routing_tempfile
+	fi
+	touch $TEMP_FILE_DIR/VPN_routing_tempfile
+	ip route flush dev $DEFAULT_DEV_TUN via $TUN_GATEWAY
+}
+
+vpnroutecheck()
+{
+	# The URL and correct VPN gateway is passed into the function via the following:
+	URL=$1
+	gw=$2
+
+        # Look up old IPs from the temp file:
+        IP_OLD=`grep -n -m 1 $URL $TEMP_FILE_DIR/VPN_routing_tempfile`
+
+	# Now we lookup new IPs 
+	IPS=`nslookup $URL 8.8.8.8 | egrep '[[:digit:]]{1,3}\.[[:digit:]]{1,3}\.[[:digit:]]{1,3}\.[[:digit:]]{1,3}' -o | grep -v '8\.8\.8\.8'`
+	
+	# Extract the IPs from IP_OLD
+	IPS_OLD=`echo $IP_OLD | egrep '[[:digit:]]{1,3}\.[[:digit:]]{1,3}\.[[:digit:]]{1,3}\.[[:digit:]]{1,3}' -o`
+
+	#We need to itterate over the IPS and see if they all exist in IP_OLD
+        IP_STRING="$URL\t"
+	IP_HAS_CHANGED=0
+
+	if [ "$IP_OLD" ]; then
+		#SECTION 1 - This section deals with a new IP not in the tempfile
+		for IP in $IPS 
+        	do 
+			if [ -z "`echo $IP_OLD | egrep \"^.*(${IP}|${IP}[[:space:]].*)\$\"`" ]; then
+				syslog "+$IP is not in tempfile for this URL" "debug"
+
+				#Creating route for new IP
+				#Grep with a space 10.0.0.11 would match 10.0.0.112
+				if [ -z "`route | egrep \"^${IP}[[:space:]].*$\"`" ]; then 
+					route add -net $IP netmask 255.255.255.255 gw $gw					
+					syslog "++route add -net $IP netmask 255.255.255.255 gw $gw" "debug"
+				fi
+			
+				#Flag the IP as changed
+				IP_HAS_CHANGED=1
+			else
+				syslog "+$IP was found in the tempfile for this URL. All Ok." "debug"
+			fi
+
+                        #As the IP is valid we want to build a new string for the tempfile
+                        IP_STRING="$IP_STRING\t$IP"
+		done
+		
+		#SECTION 2 - This section deals with an old IP in the tempfile, that is no longer valid
+		for IP in $IPS_OLD
+		do
+			if [ -z "`echo $IPS|  egrep \"^.*(${IP}|${IP}[[:space:]].*)\$\"`" ]; then
+				syslog "+$IP is in the tempfile, but is no longer related to $URL" "debug"
+				
+                                #Pull down the old route if in route table
+                                if [ -n "`route | egrep \"^${IP}[[:space:]].*$\"`" ]; then 
+                                        route del -net $IP netmask 255.255.255.255
+                                        syslog "++route del -net $IP netmask 255.255.255.255" "debug"
+                                fi
+
+                                #Flag the IP as changed
+                                IP_HAS_CHANGED=1
+			fi
+		done
+
+		#Now we can update the tempfile if necessary
+		if [ $IP_HAS_CHANGED == 1 ]; then
+			#Delete the old URL line from the tempfile
+                        LINE_NO=`echo $IP_OLD | sed -n 's/^\([0-9]*\)[:].*/\1/p'`
+                        eval "sed -e '${LINE_NO}d' $TEMP_FILE_DIR/VPN_routing_tempfile" >> /tmp/VPN_routing_tempfile2
+                        mv /tmp/VPN_routing_tempfile2 /tmp/VPN_routing_tempfile
+
+		        #Add to tempfile
+        		echo -e $IP_STRING  >> $TEMP_FILE_DIR/VPN_routing_tempfile
+        		syslog "+Updated $URL in tempfile" "debug"
+		fi
+	else
+		#SECTION 3 - This section deals with a URL that is not found at all
+
+		syslog "+The URL $URL does not exist in the tempfile. Setting to build new route" "debug"
+		
+		#If there are IPs in the route table, pull them down... failsafe
+		for IP in $IPS
+		do
+	                if [ -n "`route | egrep \"^.*(${IP}|${IP}[[:space:]].*)\$\"`" ]; then
+        	                route del -net $IP netmask 255.255.255.255
+               		        syslog "+route del -net $IP netmask 255.255.255.255" "debug"
+                        fi
+		done
+	
+		#We are clean, build a new route
+		vpnroutebuild $URL $gw		
+	fi		
+
+	return
+}
+
+vpnroutebuild()
+{
+	#Parameters passed to this function
+	URL=$1
+	gw=$2
+	syslog "Building route for URL:$URL GATEWAY:$gw" "debug"
+
+	#Look up IPs 
+	IPS=`nslookup $URL 8.8.8.8 | egrep '[[:digit:]]{1,3}\.[[:digit:]]{1,3}\.[[:digit:]]{1,3}\.[[:digit:]]{1,3}' -o | grep -v '8\.8\.8\.8'`
+
+	#String for storing in the tempfile
+	IP_STRING="$URL\t"
+
+	for IP in $IPS 
+	do 
+	        # Route the IPs to the correct VPN gateway
+        	if [ -n "$IP" ]; then
+                	if [ "`grep -c $IP "$TEMP_FILE_DIR/VPN_routing_tempfile"`" == 0 ]; then
+				#Create the route
+				route add -net $IP netmask 255.255.255.255 gw $gw
+                		syslog "+route add -net $IP netmask 255.255.255.255 gw $gw" "debug"
+			fi
+
+			#Add the route to the temp file string
+			IP_STRING="$IP_STRING\t$IP"							
+        	fi
+	done
+	
+	#Add to tempfile
+	echo -e $IP_STRING  >> $TEMP_FILE_DIR/VPN_routing_tempfile
+	syslog "+Added $URL to tempfile" "debug"
+
+	return
+}
+
+#This monitors a device and if enabled logs all its DNSqueries
+#to then add to the routing tables. It reads devicegrab.conf
+#For IP addresses to check through the router logs
+#
+#You must set the IP of the devices to be static
+#
+#For add your IP for Skybox, Roku player... all these geo-specific devices
+#The DNS lookups they use will then be used to forward traffic from any device
+deviceDNSGrabber() {
+    	syslog "Starting the DNS Grabber" "info"
+
+	#Clean up the temp files
+        if [ -e $TEMP_FILE_DIR/logread_dump ]; then
+                rm -f $TEMP_FILE_DIR/logread_dump
+                touch $TEMP_FILE_DIR/logread_dump
+        fi
+
+        #IF $SYSLOGTYPE=0 then we dump the whole of logread to a file
+        if [ $SYSLOGTYPE == 0 ]; then
+                syslog "Using the logread for memory log cache.. this may miss results if log is small" "warning"
+                /sbin/logread| grep dnsmasq |grep query |grep from >> $TEMP_FILE_DIR/logread_dump
+        else 
+       		syslog "Checking for system log file $SYSLOGFILE" "info"
+   	     	if [ -e $SYSLOGFILE ]; then
+                      syslog "Found log file $SYSLOGFILE" "info"
+                      cat $SYSLOGFILE| grep dnsmasq |grep query |grep from >> $TEMP_FILE_DIR/logread_dump
+                fi
+        fi
+
+        #Find when we last read the log, or goto beginning of time
+        if [ -e $TEMP_FILE_DIR/logread_timestamp ]; then
+		DATE=`cat $TEMP_FILE_DIR/logread_timestamp`
+		TIMESTAMP=`date -D "%b %d %H:%M:%S" -d "$DATE" "+%s"`
+		syslog "Reading DNS log from $DATE" "info"
+		rm $TEMP_FILE_DIR/logread_timestamp
+        else
+                #Timestamp from beginning of year
+		syslog "Reading DNS log from start" "info"
+		TIMESTAMP=`date -D "%b %d %H:%M:%S" -d "Jan 1 00:00:00" "+%s"`
+        fi
+
+        #Now create a new timestamp for next time we pass through here (grabs last time of log)
+        DATE=`awk '/./{line=$0} END{print line}' /tmp/logread_dump | awk '{print $1,$2,$3}'`
+	syslog "Saving $DATE to Timestamp file as next time start point in log" "info"
+        echo $DATE >> $TEMP_FILE_DIR/logread_timestamp
+
+	#We now will filter the logread_dump by timestamp
+        if [ -e $TEMP_FILE_DIR/logread_dump_tsfiltered ]; then
+		echo bbb
+		rm $TEMP_FILE_DIR/logread_dump_tsfiltered
+        fi
+        touch $TEMP_FILE_DIR/logread_dump_tsfiltered
+
+        #Read the logfile timestamp to EOF
+        while read -r LINE; do
+                DATE=`echo $LINE| awk '{print $1,$2,$3}'`
+                LINE_TS=`date -D "%b %d %H:%M:%S" -d "$DATE" "+%s"`
+                if [ $LINE_TS -gt $TIMESTAMP ]; then
+                	echo "$LINE" >> $TEMP_FILE_DIR/logread_dump_tsfiltered
+                fi
+	done < $TEMP_FILE_DIR/logread_dump
+
+	#If an old logread file exists, get rid
+	if [ -e $TEMP_FILE_DIR/logread ]; then
+		rm $TEMP_FILE_DIR/logread	
+	fi
+
+	#Get all the DNS Queries from the registered IP Addresses
+	while read -r IP; do
+           	case $IP in
+			"") ;;
+			\#*) ;;
+			*)	syslog "Looking at the DNS logs for device IP $IP" "info";
+				cat $TEMP_FILE_DIR/logread_dump_tsfiltered |grep $IP >> $TEMP_FILE_DIR/logread 
+				;;
+		esac
+	done < $CONF_FOLDER/devicegrab.conf
+
+	#Copy those IP to URL_user.conf
+	while read -r URI; do
+		case $URI in
+			"") ;;
+			\#*) ;;
+			*\[SOA\]*) ;;
+			*.lan*) ;;
+			*) echo $URI | sed -r 's/.*query\[.*\] (.*)from(.*)/\1/' >> $CONF_FOLDER/URL_auto.conf ;;
+		esac
+	done < $TEMP_FILE_DIR/logread    
+
+	#Remove duplicate entries from URL_auto.conf
+        cat $CONF_FOLDER/URL_auto.conf | sort -u | uniq > $TEMP_FILE_DIR/URL_auto.conf
+        rm $CONF_FOLDER/URL_auto.conf
+        cp $TEMP_FILE_DIR/URL_auto.conf $CONF_FOLDER/URL_auto.conf
+
+	#A bit of syslog to say what we have
+	syslog "The following URLs will be added to URL_auto.conf" "debug"
+	
+	while read -r URL; do
+		syslog "+$URL"	"debug"
+	done < $CONF_FOLDER/URL_auto.conf	
+}
+
+###MAIN ROUTINE
+if [ -z "$1" -o -z "$2" ];then
+	help
+	exit 1	
+fi
+
+
+#By default we do not flush
+RUN_FLUSH=0
+
+#Options the script was called with
+shift 2
+while getopts hvl:d:w:nfr:s: option; do
+	case ${option} in 
+        	h) help;; 
+                v) echo "Version $VERSION"; exit 1;;
+                l) DEBUG_LEVEL=${OPTARG};;  
+                d) DEFAULT_DEV_TUN="tun${OPTARG}";;
+		w) WAN_DEV="${OPTARG}";;
+		n) SCREEN_DNS=1;;
+		f) RUN_FLUSH=1;; 
+		r) SYSLOGTYPE="${OPTARG}";;
+		s) SYSLOGFILE="${OPTARG}";;
+        esac 
+done
+
+#Init the log levels and put some starting info
+initloglevels
+syslog "VPN Routing Script Started" "info"
+syslog "VPN Device is : $DEFAULT_DEV_TUN" "info"
+syslog "WAN Device is : $WAN_DEV" "info"
+
+#Create a local symlink for the VPN server
+if [ ! -e $ROOT_FOLDER/$VPN_NAME ]; then
+	ln -s $VPN_EXECUTABLE $ROOT_FOLDER/$VPN_NAME
+	chmod +x $ROOT_FOLDER/$VPN_NAME
+	if [ ! -s $ROOT_FOLDER/$VPN_NAME ]; then
+		syslog "Could not create symbolic link for $VPN_EXECUTABLE" "error"
+	else
+		syslog "Created symbolic link $ROOT_FOLDER/$VPN_NAME to $VPN_EXECUTABLE" "info"
+	fi
+fi
+
+#Check the VPN has a conf file... no? well quit.
+if [ ! -e $CONF_FOLDER/$VPN_NAME.conf ]; then
+	syslog "No $VPN_NAME.conf file was found" "error"
+	exit 0;
+fi
+
+#Check vpn is up, if not restart it
+if [ -n "`pgrep $VPN_NAME`" ]; then
+	syslog "VPNs are up, as they should be" "info"
+else
+	syslog "VPNs have a problem. Making sure processes are killed, then restarting them" "warn"
+	pkill $VPN_NAME
+	sleep 1
+	$ROOT_FOLDER/$VPN_NAME --dev $DEFAULT_DEV_TUN --config $CONF_FOLDER/$VPN_NAME.conf
+	sleep 10
+    	if [ -e $TEMP_FILE_DIR/VPN_routing_tempfile ];then
+    		rm $TEMP_FILE_DIR/VPN_routing_tempfile
+    	fi
+fi
+
+#If VPN are up we can get some IP addresses
+WAN_IP=`route | grep $WAN_DEV | grep 'UG ' | egrep '[[:digit:]]{1,3}\.[[:digit:]]{1,3}\.[[:digit:]]{1,3}\.[[:digit:]]{1,3}' -o | grep -v '0\.0\.0\.0'`
+TUN_GATEWAY=`route | grep $DEFAULT_DEV_TUN | grep 'UH' | egrep '[[:digit:]]{1,3}\.[[:digit:]]{1,3}\.[[:digit:]]{1,3}\.[[:digit:]]{1,3}' -o | grep -v '255\.255\.255\.255'`
+
+#Cross checks, we should bug out if the WAN_IP and TUN_GATEWAY are empty
+if [ ! -n "$WAN_IP" ];then
+	syslog "Can not find interface $WAN_DEV" "error"
+	exit 0
+else
+	syslog "WAN IP address is $WAN_IP" "info"
+fi
+if [ ! -n "$TUN_GATEWAY" ];then
+	syslog "Can not find IP address for Tunnel Device $DFAULT_DEV_TUN" "error"
+	exit 0
+else
+	syslog "Tunnel IP address is $TUN_GATEWAY" "info"
+fi
+
+#We can flush the tables at this point if requested
+if [ $RUN_FLUSH == 1 ]; then
+	flush	
+	exit 1
+fi
+
+#Check the DNS logs for devices we want to fully screen
+if [ $SCREEN_DNS == 1 ]; then
+	deviceDNSGrabber
+fi
+
+#Count entries in the URL_ files
+COUNT_MANUAL_URL=`grep -c "." $CONF_FOLDER/URL_user.conf`
+COUNT_AUTO_URL=`grep -c "." $CONF_FOLDER/URL_auto.conf`
+
+# Check temp file is there, if not flush and rebuild
+if [ -s $TEMP_FILE_DIR/VPN_routing_tempfile ]; then
+	syslog "File $TEMP_FILE_DIR/VPN_routing_tempfile exists, working with that" "info"
+	for CONF_LINE_NO in `seq $COUNT_MANUAL_URL`
+    	do
+        	URL=`sed -n ''$CONF_LINE_NO'p' $CONF_FOLDER/URL_user.conf`
+		syslog "vpnroutecheck URL: $URL GATEWAY: $TUN_GATEWAY" "debug"
+        	vpnroutecheck $URL $TUN_GATEWAY
+   	done
+        for CONF_LINE_NO in `seq $COUNT_AUTO_URL`
+        do
+                URL=`sed -n ''$CONF_LINE_NO'p' $CONF_FOLDER/URL_auto.conf`
+                syslog "vpnroutecheck URL: $URL GATEWAY: $TUN_GATEWAY" "debug"
+                vpnroutecheck $URL $TUN_GATEWAY
+        done 
+else
+    	syslog "File $TEMP_FILE_DIR/VPN_routing_tempfile does not exist, creating" "info" 
+	flush
+    	for CONF_LINE_NO in `seq $COUNT_MANUAL_URL`
+    	do
+        	URL=`sed -n ''$CONF_LINE_NO'p' $CONF_FOLDER/URL_user.conf`
+        	syslog "vpnroutebuild URL: $URL GATEWAY: $TUN_GATEWAY" "debug"
+       		vpnroutebuild $URL $TUN_GATEWAY
+    	done
+
+        for CONF_LINE_NO in `seq $COUNT_AUTO_URL` 
+        do
+                URL=`sed -n ''$CONF_LINE_NO'p' $CONF_FOLDER/URL_auto.conf`
+        	syslog "vpnroutebuild URL: $URL GATEWAY: $TUN_GATEWAY" "debug"
+                vpnroutebuild $URL $TUN_GATEWAY
+	done
+fi
+
+#Add and entry to ensure traffic for the VPN server always goes through the
+#normal gateway and not trying to send in a loop
+syslog "Final Stages, ensuring all VPN traffic to WAN and not itself" "info"
+
+if [ -e $TEMP_FILE_DIR/route_dump ];then
+	rm $TEMP_FILE_DIR/route_dump
+fi
+route >> $TEMP_FILE_DIR/route_dump
+
+VPN_ROUTE_EXISTS=0
+while read -r ROUTELINE; do
+	#Grab only routeline with VPN_SERVER
+	if [ -n "`echo "$ROUTELINE" | egrep \"^${VPN_SERVER}.*\$\"`" ];then
+		#Now check if it points to WAN_IP
+		if [ -n "`echo \"$ROUTELINE\" | egrep \"^${VPN_SERVER}[[:blank:]]*${WAN_IP}.*\$\" `" ];then
+			syslog "+VPN $VPN_SERVER points to WAN $WAN_IP. All Ok" "info"
+			VPN_ROUTE_EXISTS=1
+		else		
+			GW=`echo \"$ROUTELINE\"| awk '{print $2}'`
+			syslog "+VPN $VPN_SERVER points to incorrect WAN $GW. Deleting Route" "info"
+			route delete $VPN_SERVER gw $GW
+			syslog "+route delete $VPN_SERVER gw $GW" "info"
+		fi					
+	fi
+done < $TEMP_FILE_DIR/route_dump
+
+#So if no VPN route lets create it.
+if [ $VPN_ROUTE_EXISTS == 0 ];then
+	route add -net $VPN_SERVER netmask 255.255.255.255 gw $WAN_IP
+        syslog "+VPN not pointing at WAN, correcting" "info"
+        syslog "+route add -net $VPN_SERVER netmask 255.255.255.255 gw $WAN_IP" "info"
+fi
+
+syslog "Finished" "info"
+
+exit 1

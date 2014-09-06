@@ -1,0 +1,26 @@
+#!/bin/sh
+
+echo "Checking for Openvpn"
+VPN_INSTALLED=`opkg list_installed |grep openvpn`
+if [ -z "$VPN_INSTALLED" ]; then
+	echo "Installing openvpn"
+	opkg install openvpn
+else
+	echo "Openvpn is installed"
+fi
+
+if [ -e "/usr/sbin/urlroute" ];then
+	rm /usr/sbin/urlroute
+fi
+echo "Adding urlroute to /usr/sbin"
+cp urlroute /usr/sbin/urlroute
+
+if [ -d "/etc/urlroute/vpn1_example" ]; then
+	rm -rf /etc/urlroute/vpn1_example
+fi
+
+echo "Creating /etc/urlroute"
+mkdir -p /etc/urlroute
+echo "Copying vpn1_example to /etc/urlroute"
+cp -Rv vpn1_example /etc/urlroute/ 
+
