@@ -14,7 +14,7 @@ ROOT_FOLDER="/etc/urlroute/$VPN_NAME"
 CONF_FOLDER=$ROOT_FOLDER/conf
 TEMP_FILE_DIR="/etc/urlroute/$VPN_NAME/tmp"
 VPN_EXECUTABLE="/usr/sbin/openvpn"
-DEFAULT_DEV_TUN="tun2" 			#can be set with the -d option
+DEFAULT_DEV_TUN="tun0" 			#can be set with the -d option
 WAN_DEV="br-wan" 			#can be set with the -w option
 SCREEN_DNS=0				#can be set with the -n option
 LOG_ERROR=0
@@ -130,6 +130,12 @@ vpnroutecheck()
 		#SECTION 1 - This section deals with a new IP not in the tempfile
 		for IP in $IPS 
         	do 
+			#Bug out if the IP is the VPN_SERVER #No circular loops
+			if [ $IP == $VPN_SERVER ];then
+				syslog "IP points to VPN Server, ignoring" "debug"
+				return	
+			fi			
+
 			if [ -z "`echo $IP_OLD | egrep \"^.*(${IP}|${IP}[[:space:]].*)\$\"`" ]; then
 				syslog "+$IP is not in tempfile for this URL" "debug"
 
@@ -171,8 +177,8 @@ vpnroutecheck()
 		if [ $IP_HAS_CHANGED == 1 ]; then
 			#Delete the old URL line from the tempfile
                         LINE_NO=`echo $IP_OLD | sed -n 's/^\([0-9]*\)[:].*/\1/p'`
-                        eval "sed -e '${LINE_NO}d' $TEMP_FILE_DIR/VPN_routing_tempfile" >> /tmp/VPN_routing_tempfile2
-                        mv /tmp/VPN_routing_tempfile2 /tmp/VPN_routing_tempfile
+                        eval "sed -e '${LINE_NO}d' $TEMP_FILE_DIR/VPN_routing_tempfile" >> $TEMP_FILE_DIR/VPN_routing_tempfile2
+                        mv $TEMP_FILE_DIR/VPN_routing_tempfile2 $TEMP_FILE_DIR/VPN_routing_tempfile
 
 		        #Add to tempfile
         		echo -e $IP_STRING  >> $TEMP_FILE_DIR/VPN_routing_tempfile
@@ -217,9 +223,15 @@ vpnroutebuild()
 	        # Route the IPs to the correct VPN gateway
         	if [ -n "$IP" ]; then
                 	if [ "`grep -c $IP "$TEMP_FILE_DIR/VPN_routing_tempfile"`" == 0 ]; then
-				#Create the route
-				route add -net $IP netmask 255.255.255.255 gw $gw
-                		syslog "+route add -net $IP netmask 255.255.255.255 gw $gw" "debug"
+				#Test route does not include our own VPN_IP
+				if [ ! $IP == $VPN_SERVER ];then
+					#Create the route
+					route add -net $IP netmask 255.255.255.255 gw $gw
+                			syslog "+route add -net $IP netmask 255.255.255.255 gw $gw" "debug"
+				else
+	                                syslog "IP points to VPN Server, ignoring" "debug"   
+					return
+				fi
 			fi
 
 			#Add the route to the temp file string
@@ -248,9 +260,9 @@ deviceDNSGrabber() {
 	#Clean up the temp files
         if [ -e $TEMP_FILE_DIR/logread_dump ]; then
                 rm -f $TEMP_FILE_DIR/logread_dump
-                touch $TEMP_FILE_DIR/logread_dump
         fi
-
+	touch $TEMP_FILE_DIR/logread_dump
+	
         #IF $SYSLOGTYPE=0 then we dump the whole of logread to a file
         if [ $SYSLOGTYPE == 0 ]; then
                 syslog "Using the logread for memory log cache.. this may miss results if log is small" "warning"
@@ -260,7 +272,10 @@ deviceDNSGrabber() {
    	     	if [ -e $SYSLOGFILE ]; then
                       syslog "Found log file $SYSLOGFILE" "info"
                       cat $SYSLOGFILE| grep dnsmasq |grep query |grep from >> $TEMP_FILE_DIR/logread_dump
-                fi
+                else
+		      syslog "Was looking for $SYSLOGFILE (-r option), but could not find" "error"
+		      exit 0	
+		fi
         fi
 
         #Find when we last read the log, or goto beginning of time
@@ -276,13 +291,12 @@ deviceDNSGrabber() {
         fi
 
         #Now create a new timestamp for next time we pass through here (grabs last time of log)
-        DATE=`awk '/./{line=$0} END{print line}' /tmp/logread_dump | awk '{print $1,$2,$3}'`
+        DATE=`awk '/./{line=$0} END{print line}' $TEMP_FILE_DIR/logread_dump | awk '{print $1,$2,$3}'`
 	syslog "Saving $DATE to Timestamp file as next time start point in log" "info"
         echo $DATE >> $TEMP_FILE_DIR/logread_timestamp
 
 	#We now will filter the logread_dump by timestamp
         if [ -e $TEMP_FILE_DIR/logread_dump_tsfiltered ]; then
-		echo bbb
 		rm $TEMP_FILE_DIR/logread_dump_tsfiltered
         fi
         touch $TEMP_FILE_DIR/logread_dump_tsfiltered
@@ -312,7 +326,7 @@ deviceDNSGrabber() {
 		esac
 	done < $CONF_FOLDER/devicegrab.conf
 
-	#Copy those IP to URL_user.conf
+	#Copy those IP to URL_auto.conf
 	while read -r URI; do
 		case $URI in
 			"") ;;
@@ -336,6 +350,11 @@ deviceDNSGrabber() {
 	done < $CONF_FOLDER/URL_auto.conf	
 }
 
+clearAUTOfile() {
+	rm $CONF_FOLDER/URL_auto.conf
+	touch $CONF_FOLDER/URL_auto.conf
+}
+
 ###MAIN ROUTINE
 if [ -z "$1" -o -z "$2" ];then
 	help
@@ -348,12 +367,13 @@ RUN_FLUSH=0
 
 #Options the script was called with
 shift 2
-while getopts hvl:d:w:nfr:s: option; do
+while getopts hvl:d:w:nfr:s:e option; do
 	case ${option} in 
         	h) help;; 
                 v) echo "Version $VERSION"; exit 1;;
+		e) clearAUTOfile; exit 1;;
                 l) DEBUG_LEVEL=${OPTARG};;  
-                d) DEFAULT_DEV_TUN="tun${OPTARG}";;
+                d) DEFAULT_DEV_TUN="${OPTARG}";;
 		w) WAN_DEV="${OPTARG}";;
 		n) SCREEN_DNS=1;;
 		f) RUN_FLUSH=1;; 
