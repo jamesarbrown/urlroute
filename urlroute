@@ -3,9 +3,9 @@
 #Things that can be changed
 VPN_NAME=$1
 VPN_SERVER=$2
-DEBUG_LEVEL="debug"			#can be set with the -d option, valid debug, error, warn, info
-LOGGING=1				#Totally disable logging = 0
-SYSLOGTYPE=0 				#can be set with the -r option, 0=logread, 1=file
+DEBUG_LEVEL="debug"					#can be set with the -d option, valid debug, error, warn, info
+LOGGING=1							#Totally disable logging = 0
+SYSLOGTYPE=0 						#can be set with the -r option, 0=logread, 1=file
 SYSLOGFILE="/mnt/usb/log/syslog"	#can be set with the -s option, SYSLOGTYPE has to be 1
 
 #Things that should not need changing
@@ -15,8 +15,8 @@ CONF_FOLDER=$ROOT_FOLDER/conf
 TEMP_FILE_DIR="/etc/urlroute/$VPN_NAME/tmp"
 VPN_EXECUTABLE="/usr/sbin/openvpn"
 DEFAULT_DEV_TUN="tun0" 			#can be set with the -d option
-WAN_DEV="br-wan" 			#can be set with the -w option
-SCREEN_DNS=0				#can be set with the -n option
+WAN_DEV="br-wan" 				#can be set with the -w option
+SCREEN_DNS=0					#can be set with the -n option
 LOG_ERROR=0
 LOG_INFO=0
 LOG_WARN=0
@@ -516,6 +516,15 @@ if [ $VPN_ROUTE_EXISTS == 0 ];then
 	route add -net $VPN_SERVER netmask 255.255.255.255 gw $WAN_IP
         syslog "+VPN not pointing at WAN, correcting" "info"
         syslog "+route add -net $VPN_SERVER netmask 255.255.255.255 gw $WAN_IP" "info"
+fi
+
+#Now ensure everything else to the same subnet as VPN server goes there
+TUN_SUBNET=`echo $TUN_GATEWAY | egrep '^[[:digit:]]{1,3}\.[[:digit:]]{1,3}\.[[:digit:]]{1,3}\.' -o`0
+TUN_NETMASK="255.255.0.0"
+if [ -z "`route |grep $TUN_SUBNET`" ];then
+	syslog "Ensuring all traffic for subnet $TUN_SUBNET goes to the VPN" "info"
+	syslog "route add -net $TUN_SUBNET netmask $TUN_NETMASK gateway $TUN_GATEWAY" "info"
+	route add -net $TUN_SUBNET netmask $TUN_NETMASK gateway $TUN_GATEWAY
 fi
 
 syslog "Finished" "info"
